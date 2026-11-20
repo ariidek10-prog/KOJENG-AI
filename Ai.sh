@@ -7,7 +7,7 @@ Jalan di Termux (tanpa Termux:API pun bisa). Dependensi: requests
   python kojeng_ai.py
 """
 import os, sys, json, time, re, ast, shutil, subprocess, threading, itertools
-import tempfile, math, importlib.util
+import tempfile, math, importlib.util, getpass
 
 try:
     import readline  # panah atas/bawah = riwayat input
@@ -18,7 +18,7 @@ try:
 except ImportError:
     sys.exit("Install dulu: pip install requests")
 
-VERSION = "2.0"
+VERSION = "2.1"
 CFG_PATH = os.path.expanduser("~/.kojeng_ai.json")
 OLD_CFG_PATH = os.path.expanduser("~/.cyberai.json")
 OUT_DIR = os.path.expanduser("~/cyberai_out")
@@ -29,8 +29,8 @@ DEFAULT = {
     "keys": {"gemini": "", "openrouter": "", "groq": ""},
     "models": {
         "gemini": "gemini-2.5-flash",
-        "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
-        "groq": "llama-3.3-70b-versatile",
+        "openrouter": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "groq": "openai/gpt-oss-120b",
     },
     "speed": 0.006,     # detik per huruf (efek ngetik); 0 = instan
     "rounds": 3,        # maksimal putaran review -> bug hunt -> fix
@@ -38,6 +38,19 @@ DEFAULT = {
     "autorun": None,    # izin menjalankan kode hasil AI untuk tes (None = tanya)
     "order": {},        # override urutan provider per agen
 }
+
+# Model yang sudah dimatikan penyedia -> otomatis diganti default baru saat config dimuat
+DEAD_MODELS = {"llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3-32b",
+               "meta-llama/llama-4-scout-17b-16e-instruct", "meta-llama/llama-3.3-70b-instruct:free",
+               "deepseek/deepseek-r1:free", "mistralai/mistral-nemo:free"}
+PREFER = {
+    "groq": ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"],
+    "openrouter": ["nvidia/nemotron-3-ultra-550b-a55b:free", "cohere/north-mini-code:free",
+                   "google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free", "openrouter/free"],
+    "gemini": ["gemini-2.5-flash"],
+}
+BAD_WORDS = ("whisper", "guard", "tts", "orpheus", "embed", "image", "audio", "lyria", "-vl", "omni",
+             "safeguard", "playai", "compound", "live", "imagen", "veo", "aqa", "learnlm")
 
 SAFE = ("Fokus pada software legal, defensif, edukasi, dan tooling developer. "
         "Tolak membuat malware, ransomware, atau exploit untuk menyerang pihak lain. ")
@@ -90,6 +103,8 @@ def load_cfg():
             cfg["keys"][p] = os.environ[e]
     for p in cfg["keys"]:
         cfg["keys"][p] = (cfg["keys"][p] or "").strip()
+        if cfg["models"].get(p) in DEAD_MODELS:
+            cfg["models"][p] = DEFAULT["models"][p]
     return cfg
 
 
@@ -111,6 +126,10 @@ STAMP = time.strftime("%Y%m%d_%H%M%S")
 
 class AuthError(RuntimeError):
     pass
+
+
+class ModelError(RuntimeError):
+    """Model tidak ada / sudah dimatikan penyedia."""
 
 
 # ------------------------------------------------------------------ http / providers
@@ -138,6 +157,13 @@ def post(url, headers, payload, tries=3):
             return data
         if r.status_code in (401, 403):
             raise AuthError(f"HTTP {r.status_code}: {r.text[:100]}")
+        low = r.text.lower()
+        if r.status_code == 404 and "data policy" in low:
+            raise RuntimeError("OpenRouter menolak model gratis: buka openrouter.ai/settings/privacy "
+                               "lalu aktifkan 'Free model publication'")
+        if r.status_code == 404 or (r.status_code == 400 and "model" in low and any(
+                w in low for w in ("not found", "does not exist", "decommission", "not supported", "no endpoints"))):
+            raise ModelError(f"HTTP {r.status_code}: {r.text[:200]}")
         if r.status_code in (408, 429, 500, 502, 503, 504):
             ra = r.headers.get("Retry-After", "")
             try:
@@ -149,6 +175,65 @@ def post(url, headers, payload, tries=3):
             continue
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:140]}")
     raise RuntimeError(last)
+
+
+def http_get(url, headers=None):
+    r = requests.get(url, headers=headers or {}, timeout=(10, 30))
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return r.json()
+
+
+def list_models(p):
+    key = CFG["keys"][p]
+    if p == "gemini":
+        d = http_get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                     {"x-goog-api-key": key})
+        return [m["name"].split("/", 1)[-1] for m in d.get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])]
+    if p == "groq":
+        d = http_get("https://api.groq.com/openai/v1/models", {"Authorization": f"Bearer {key}"})
+        return [m["id"] for m in d.get("data", [])]
+    d = http_get("https://openrouter.ai/api/v1/models")
+    return [m["id"] for m in d.get("data", [])]
+
+
+def pick_model(p, ids):
+    ids = [i for i in ids if not any(b in i.lower() for b in BAD_WORDS)]
+    if p == "openrouter":
+        ids = [i for i in ids if i.endswith(":free") or i == "openrouter/free"]
+    for pref in PREFER.get(p, []):
+        if pref in ids:
+            return pref
+    if p == "gemini":
+        fl = [i for i in ids if "flash" in i and not any(x in i for x in ("lite", "preview", "exp", "thinking"))]
+        return sorted(fl)[-1] if fl else (ids[0] if ids else None)
+    return ids[0] if ids else None
+
+
+def heal_model(p):
+    """Cari model aktif lewat API /models lalu simpan. None jika tidak ada pengganti."""
+    try:
+        new = pick_model(p, list_models(p))
+    except Exception:
+        return None
+    if not new or new == CFG["models"][p]:
+        return None
+    CFG["models"][p] = new
+    save_cfg(CFG)
+    return new
+
+
+def call_with_heal(p, system, messages):
+    try:
+        return call_provider(p, system, messages)
+    except ModelError:
+        old = CFG["models"][p]
+        new = heal_model(p)
+        if not new:
+            raise
+        NOTES.append(f"{p}: model '{old}' sudah tidak ada, otomatis ganti ke '{new}'")
+        return call_provider(p, system, messages)
 
 
 def call_gemini(model, key, system, messages):
@@ -172,20 +257,23 @@ def call_gemini(model, key, system, messages):
     return text, fin == "MAX_TOKENS"
 
 
-def call_openai_style(url, key, model, system, messages, extra=None, cap=None):
+def call_openai_style(url, key, model, system, messages, extra=None, cap=None, body_extra=None):
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     headers.update(extra or {})
     mt = min(int(CFG["max_tokens"]), cap) if cap else int(CFG["max_tokens"])
-    data = post(url, headers, {"model": model, "max_tokens": mt,
-                               "messages": [{"role": "system", "content": system}] + messages})
+    body = {"model": model, "max_tokens": mt,
+            "messages": [{"role": "system", "content": system}] + messages}
+    body.update(body_extra or {})
+    data = post(url, headers, body)
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("balasan tanpa choices")
     ch = choices[0]
     text = (ch.get("message") or {}).get("content") or ""
+    cut = ch.get("finish_reason") == "length"
     if not text.strip():
-        raise RuntimeError("balasan kosong")
-    return text, ch.get("finish_reason") == "length"
+        raise RuntimeError("balasan kosong" + (" (token habis dipakai reasoning)" if cut else ""))
+    return text, cut
 
 
 def call_provider(p, system, messages):
@@ -194,7 +282,8 @@ def call_provider(p, system, messages):
         return call_gemini(model, key, system, messages)
     if p == "groq":
         return call_openai_style("https://api.groq.com/openai/v1/chat/completions",
-                                 key, model, system, messages, cap=4096)  # aman untuk limit TPM gratis
+                                 key, model, system, messages, cap=4096,  # aman untuk limit TPM gratis
+                                 body_extra=({"reasoning_effort": "low"} if model.startswith("openai/gpt-oss") else None))
     return call_openai_style("https://openrouter.ai/api/v1/chat/completions", key, model,
                              system, messages, {"X-Title": "KOJENG AI"})
 
@@ -211,7 +300,7 @@ def ask(role, messages):
             fails.append(f"{p}: nonaktif ({DEAD[p]})")
             continue
         try:
-            text, trunc = call_provider(p, system, messages)
+            text, trunc = call_with_heal(p, system, messages)
             n = 0
             while trunc and n < 2:
                 n += 1
@@ -288,17 +377,41 @@ class Spin:
             sys.stdout.flush()
 
 
+LETTERS = {
+    "K": ["██╗  ██╗", "██║ ██╔╝", "█████╔╝ ", "██╔═██╗ ", "██║  ██╗", "╚═╝  ╚═╝"],
+    "O": [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "J": ["     ██╗", "     ██║", "     ██║", "██   ██║", "╚█████╔╝", " ╚════╝ "],
+    "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
+    "N": ["███╗   ██╗", "████╗  ██║", "██╔██╗ ██║", "██║╚██╗██║", "██║ ╚████║", "╚═╝  ╚═══╝"],
+    "G": [" ██████╗ ", "██╔════╝ ", "██║  ███╗", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+}
+GRAD = [118, 82, 46, 46, 40, 34]  # hijau neon -> hijau tua
+
+
+def banner_lines(cols=64):
+    """Banner tebal KOJENG; otomatis versi ringkas jika layar sempit."""
+    rows = ["".join(LETTERS[c][r] for c in "KOJENG") for r in range(6)]
+    w = len(rows[0])
+    if cols < w + 1:
+        inner = "   K O J E N G   "
+        return [f"\033[1;38;5;46m╔{'═' * len(inner)}╗", f"║{B}{inner}{X}\033[1;38;5;46m║",
+                f"╚{'═' * len(inner)}╝{X}", f"{B}{G}{'A I   S Q U A D'.center(len(inner) + 2)}{X}"]
+    out = [f"\033[1;38;5;{GRAD[i]}m{row}{X}" for i, row in enumerate(rows)]
+    out.append(f"\033[1;38;5;46m{'▀' * w}{X}")
+    out.append(f"{B}{G}{'A I    S Q U A D'.center(w)}{X}")
+    return out
+
+
 def banner():
-    art = r"""
- _  __   ___       _   _____  _   _   ____ 
-| |/ /  / _ \     | | | ____|| \ | | / ___|
-| ' /  | | | | _  | | |  _|  |  \| || |  _ 
-| . \  | |_| || |_| | | |___ | |\  || |_| |
-|_|\_\  \___/  \___/ |_____||_| \_| \____|
-          A I   S Q U A D
-"""
-    print(G + art + X)
-    typewrite(f">> KOJENG AI v{VERSION} ONLINE | Gemini + OpenRouter + Groq", G)
+    cols = shutil.get_terminal_size((64, 24)).columns
+    print()
+    for ln in banner_lines(cols):
+        print(ln)
+        if sys.stdout.isatty():
+            sys.stdout.flush()
+            time.sleep(0.05)
+    print()
+    typewrite(f">> KOJENG AI v{VERSION} ONLINE | Gemini + OpenRouter + Groq", B + G)
     typewrite(">> ketik /help untuk daftar perintah", D)
 
 
@@ -607,6 +720,8 @@ HELP = """Perintah:
   /chat <teks>      tanya cepat 1 AI (ada memori obrolan)
   /test             tes semua key & model sekarang juga
   /keys             atur API key & model
+  /models [prov]    daftar model aktif dari provider (anti-404)
+  /model P <id|auto> ganti model (contoh: /model groq auto)
   /agents           lihat pembagian tugas agen
   /assign R P       ubah provider utama agen (contoh: /assign CODER gemini)
   /rounds <n>       maksimal putaran verifikasi
@@ -623,13 +738,22 @@ def mask(k):
     return (k[:4] + "…" + k[-3:]) if len(k) > 8 else ("***" if k else "")
 
 
+def read_secret(label):
+    try:
+        return getpass.getpass(label).strip()
+    except Exception:
+        return input(label).strip()
+
+
 def setup_keys():
+    print(f"{D}Key disembunyikan saat diketik/ditempel (aman dari screenshot). Tekan Enter setelah paste.{X}")
     for p in ("gemini", "openrouter", "groq"):
-        k = input(f"{p} API key [{mask(CFG['keys'][p]) or 'kosong'}] (Enter = tetap): ").strip()
+        k = read_secret(f"{p} API key [{mask(CFG['keys'][p]) or 'kosong'}] (Enter = tetap): ")
         if k:
             CFG["keys"][p] = k
             DEAD.pop(p, None)
-        m = input(f"  model {p} [{CFG['models'][p]}]: ").strip()
+            print(f"{G}  ✔ {p}: {mask(k)}{X}")
+        m = input(f"  model {p} [{CFG['models'][p]}] (Enter = tetap): ").strip()
         if m:
             CFG["models"][p] = m
     save_cfg(CFG)
@@ -647,23 +771,69 @@ def status():
 
 
 def ping_all():
-    rows = []
+    rows, details, models = [], [], []
     for p in CFG["keys"]:
         if not CFG["keys"][p]:
             rows.append((p, "OFF", "key kosong"))
             continue
         t0 = time.time()
+        NOTES.clear()
         try:
             with Spin(f"tes {p}..."):
-                text, _ = call_provider(p, "Balas hanya: OK", [{"role": "user", "content": "ping"}])
+                call_with_heal(p, "Balas hanya: OK", [{"role": "user", "content": "ping"}])
             DEAD.pop(p, None)
-            rows.append((p, "OK", f"{time.time() - t0:.1f}s"))
-        except AuthError:
+            rows.append((p, "OK", f"{time.time() - t0:.1f} detik"))
+            models.append(f"{p} -> {CFG['models'][p]}")
+        except AuthError as e:
             DEAD[p] = "key ditolak"
             rows.append((p, "GAGAL", "key ditolak"))
+            details.append(f"{p}: {e}")
         except Exception as e:
-            rows.append((p, "GAGAL", str(e)[:22]))
+            rows.append((p, "GAGAL", "lihat detail"))
+            details.append(f"{p}: {e}")
+        for n in NOTES:
+            details.append(f"info: {n}")
+        NOTES.clear()
     box(rows, ("Provider", "Hasil", "Info"))
+    for m in models:
+        print(f"{D}  model: {m}{X}")
+    for d in details:
+        print(f"{Y}• {d[:400]}{X}")
+
+
+def models_cmd(arg):
+    parts = arg.split()
+    sel = [parts[0].lower()] if parts and parts[0].lower() in CFG["keys"] else [p for p in CFG["keys"] if CFG["keys"][p]]
+    for p in sel:
+        try:
+            ids = list_models(p)
+        except Exception as e:
+            print(f"{Y}{p}: gagal ambil daftar ({str(e)[:80]}){X}")
+            continue
+        good = [i for i in ids if not any(b in i.lower() for b in BAD_WORDS)]
+        if p == "openrouter":
+            good = [i for i in good if i.endswith(":free") or i == "openrouter/free"]
+        print(f"{B}{p}{X} {D}(aktif: {CFG['models'][p]}){X}")
+        for i in good[:15]:
+            print(f"  {'★' if i == CFG['models'][p] else ' '} {i}")
+        print(f"{D}  ganti: /model {p} <id>   atau   /model {p} auto{X}")
+
+
+def set_model_cmd(arg):
+    parts = arg.split()
+    if len(parts) != 2 or parts[0].lower() not in CFG["keys"]:
+        print(f"{Y}format: /model groq <id>  atau  /model groq auto{X}")
+        return
+    p, mid = parts[0].lower(), parts[1]
+    if mid.lower() == "auto":
+        new = pick_model(p, list_models(p))
+        if not new:
+            print(f"{Y}tidak ada model cocok{X}")
+            return
+        mid = new
+    CFG["models"][p] = mid
+    save_cfg(CFG)
+    print(f"{G}✔ {p} sekarang memakai: {mid}{X}")
 
 
 def show_agents():
@@ -712,6 +882,10 @@ def main():
                 ping_all()
             elif cmd == "/agents":
                 show_agents()
+            elif cmd == "/models":
+                models_cmd(arg)
+            elif cmd == "/model":
+                set_model_cmd(arg)
             elif cmd == "/assign":
                 parts = arg.split()
                 if len(parts) != 2 or parts[0].upper() not in ROLES or parts[1].lower() not in CFG["keys"]:
