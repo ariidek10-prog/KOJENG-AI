@@ -1,0 +1,2 @@
+# KOJENG-AI
+Ai intelegence
